@@ -1,0 +1,38 @@
+CONTROL (IMPLEMENTADO)
+- PID externo de diámetro: corregido — output ahora se suma al feed-forward volumétrico como corrección.
+- PID interno (RPM → duty): corregido — base duty via calibración + corrección PID por separado.
+- spooler_duty_cycle: agregado a Database y al logging.
+
+VERIFICAR EN HARDWARE ANTES DE DEPLOYAR
+- Pines M0/M1/M2 del driver (GPIO 17/27/22) deben estar conectados al GPIO de la RPi, NO jalados a tierra fija. Si están a tierra, microstepping siempre será full-step sin importar lo que escriba el código.
+- DEFAULT_MICROSTEPPING cambiado a 1/32 — verificar que el driver (DRV8825) soporte esta resolución y que los pines estén libres.
+
+VISIÓN
+- Fibra transparente/cilíndrica: bordes brillantes, centro oscuro → Hough no ve un rectángulo limpio.
+- Algoritmo actual (Canny + HoughLinesP) es frágil para este tipo de iluminación.
+- Opciones a evaluar: closing morfológico, proyección de columnas (column projection).
+
+RAM / LIMPIEZA
+- Database: cambiar todas las listas a deque(maxlen=N) — sin esto crecen sin límite por siempre.
+- Plots: ventana deslizante de últimos N puntos (igual, deque o slice).
+- Reducir resolución de cámara: cap.set(CAP_PROP_FRAME_WIDTH, 640) — cada frame sin comprimir pesa varios MB.
+- Borrar single_file.py y CLOSE LOOP_autocali.py — no se importan pero son ~2500 líneas de confusión.
+
+CSV — FORMATO NUEVO (una sola tabla, una fila por muestra)
+timestamp | elapsed_s | temp | temp_setpoint | heater_pwm | spooler_rpm | spooler_setpoint | spooler_duty_cycle | extruder_rpm | diameter | diameter_setpoint | fan_duty_cycle
+
+CSV — LO QUE FALTA GUARDAR PARA LLEGAR A ESO
+- Timestamps reales: el CSV actual usa tiempos sintéticos interpolados, no los timestamps reales de cada muestra.
+- spooler_delta_time: se loggea en Database pero no se escribe al CSV.
+- Duty cycle real enviado al motor (output_duty_cycle): no se guarda en ningún lado.
+- Heater duty cycle en modo open loop: no se loggea ni se guarda.
+- temperature_delta_time y diameter_delta_time: están declarados en Database pero nunca se les hace append.
+- Datos de visión: posición de bordes, número de líneas detectadas — nada de esto se guarda.
+- fan_duty_cycle está en la tabla de DIAMETER en el CSV, no donde debería.
+
+INTERFAZ NUEVA — LO QUE HAY QUE IMPLEMENTAR
+- Cerrar el lazo de diámetro real: usar medición de cámara como feedback del PID externo.
+- Corregir PID interno: feed-forward duty + corrección PID por separado.
+- Tunar algoritmo de visión para fibra transparente.
+- Limpiar controles: quitar Ku/Tu de diámetro si el lazo externo no existe o no funciona.
+- Agregar límite de seguridad en heater open loop (cap de temperatura).
