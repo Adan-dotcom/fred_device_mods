@@ -73,6 +73,11 @@ class Extruder:
     # Above this reading the thermistor is likely faulty (open circuit reads
     # ~220 C) or the heater is out of range — either way, force the heater off.
     MAX_SAFE_TEMPERATURE = 130
+    # The heater power stage cannot follow fast PWM (the proven old interface
+    # drives it with plain GPIO.output on/off). We do time-proportional
+    # control instead: within each window the pin is HIGH for the fraction
+    # of time the PID asks for.
+    HEATER_WINDOW = 1.0  # seconds
 
     def __init__(self, gui: UserInterface) -> None:
         self.gui = gui
@@ -86,8 +91,10 @@ class Extruder:
         GPIO.setup(Extruder.MICROSTEP_PIN_B, GPIO.OUT)
         GPIO.setup(Extruder.MICROSTEP_PIN_C, GPIO.OUT)
 
-        self.heater_pwm = GPIO.PWM(Extruder.HEATER_PIN, 1000)
-        self.heater_pwm.start(0)
+        # Heater driven by plain on/off (time-proportional), NOT GPIO.PWM:
+        # the power stage does not switch at software-PWM frequencies.
+        GPIO.output(Extruder.HEATER_PIN, GPIO.LOW)
+        self.heater_on_fraction = 0.0
         self.motor_step(0)
         self.initialize_thermistor()
         self.set_microstepping(Extruder.DEFAULT_MICROSTEPPING)
@@ -165,8 +172,21 @@ class Extruder:
             except Exception as e:
                 print(f"Error in stepper loop: {e}")
 
+    def _apply_heater(self, current_time: float) -> None:
+        """Time-proportional heater drive: HIGH for heater_on_fraction of
+        each window, LOW the rest. Same GPIO.output primitive as the proven
+        old interface — the power stage cannot follow 1 kHz PWM."""
+        phase = current_time % Extruder.HEATER_WINDOW
+        if phase < self.heater_on_fraction * Extruder.HEATER_WINDOW:
+            GPIO.output(Extruder.HEATER_PIN, GPIO.HIGH)
+        else:
+            GPIO.output(Extruder.HEATER_PIN, GPIO.LOW)
+
     def temperature_control_loop(self, current_time: float) -> None:
         """Closed loop control of the temperature of the extruder for desired diameter"""
+        # Drive the heater pin on every tick (20 Hz) so the on/off window
+        # has good resolution; the PID below only recomputes at SAMPLE_TIME.
+        self._apply_heater(current_time)
         if current_time - self.previous_time <= Extruder.SAMPLE_TIME:
             return
         try:
@@ -189,7 +209,8 @@ class Extruder:
             # Sensor sanity: an open/disconnected thermistor pulls the ADC
             # near the supply rail and reads as a very high temperature.
             if temperature > Extruder.MAX_SAFE_TEMPERATURE:
-                self.heater_pwm.ChangeDutyCycle(0)
+                self.heater_on_fraction = 0.0
+                GPIO.output(Extruder.HEATER_PIN, GPIO.LOW)
                 Database.update("heater_duty_pct", 0.0)
                 if not self._sensor_warning_shown:
                     self._sensor_warning_shown = True
@@ -209,7 +230,7 @@ class Extruder:
                 output = Extruder.MAX_OUTPUT
             elif output < Extruder.MIN_OUTPUT:
                 output = Extruder.MIN_OUTPUT
-            self.heater_pwm.ChangeDutyCycle(output * 100)
+            self.heater_on_fraction = output
             self.gui.temperature_plot.update_plot(current_time, temperature,
                                                     target_temperature)
             Database.update("temperature_c", temperature)
@@ -225,14 +246,9 @@ class Extruder:
                                   "Please restart the program.")
 
     def stop(self) -> None:
-        """Stop the heater and stepper. The PWM object is kept alive (duty 0)
-        so the heater works again on the next Start without a restart."""
+        """Stop the heater and stepper"""
         self.stop_stepper()
-        self.heater_pwm.ChangeDutyCycle(0)
+        self.heater_on_fraction = 0.0
+        GPIO.output(Extruder.HEATER_PIN, GPIO.LOW)
         Database.update("heater_duty_pct", 0.0)
-
-    def shutdown(self) -> None:
-        """Full stop — only on program exit"""
-        self.stop()
-        self.heater_pwm.stop()
 
