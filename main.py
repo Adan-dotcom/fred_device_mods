@@ -33,6 +33,7 @@ def hardware_control(gui: UserInterface) -> None:
     init_time = time.time()
     stepper_started = False
     device_was_started = False
+    spooling_was_on = False
     last_log_time = 0.0
     LOG_PERIOD = 0.1  # one CSV row every 100 ms (10 Hz)
 
@@ -44,11 +45,14 @@ def hardware_control(gui: UserInterface) -> None:
                 threading.Thread(target=spooler.calibrate, daemon=True).start()
                 gui.start_motor_calibration = False
 
-            # Detect Stop transition — always shut down heater on stop
+            # Detect Stop transition — shut down heater AND spooler motor
             if device_was_started and not gui.device_started:
                 extruder.stop()
+                spooler.update_duty_cycle(0)
+                Database.update("spooler_duty_pct", 0.0)
                 stepper_started = False
                 device_was_started = False
+                spooling_was_on = False
                 Database.end_session()
 
             if gui.device_started:
@@ -63,8 +67,16 @@ def hardware_control(gui: UserInterface) -> None:
                     stepper_started = True
                 extruder.temperature_control_loop(current_time)
                 if gui.spooling_control_state:
+                    spooling_was_on = True
                     spooler.motor_control_loop(current_time)
                 else:
+                    if spooling_was_on:
+                        # Closed loop switched off — do not leave the motor
+                        # running at the last commanded duty cycle
+                        spooling_was_on = False
+                        spooler.update_duty_cycle(0)
+                        Database.update("spooler_duty_pct", 0.0)
+                        Database.update("spooler_setpoint_rpm", 0.0)
                     # Keep measuring/plotting motor RPM even in open loop
                     spooler.update_rpm_display(current_time)
                 fan.control_loop()
@@ -82,12 +94,20 @@ def hardware_control(gui: UserInterface) -> None:
             gui.spooling_control_state = False
             stepper_started = False
             device_was_started = False
-            if fan:
-                fan.stop()
-            if spooler:
-                spooler.stop()
-            if extruder:
-                extruder.stop()
+            spooling_was_on = False
+            # Zero the outputs but keep the PWM objects alive so a retry
+            # actually works. The fan is left running to keep cooling a
+            # possibly hot heater block.
+            try:
+                if extruder:
+                    extruder.stop()
+            except Exception as stop_error:
+                print(f"Error stopping extruder: {stop_error}")
+            try:
+                if spooler:
+                    spooler.update_duty_cycle(0)
+            except Exception as stop_error:
+                print(f"Error stopping spooler: {stop_error}")
             Database.end_session()
             gui.show_message("Error in hardware control loop",
                              "Device stopped. Press Start to try again.")

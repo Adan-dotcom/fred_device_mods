@@ -34,5 +34,6 @@ class Fan:
             self.update_duty_cycle(self.gui.fan_duty_cycle.value())
         except Exception as e:
             print(f"Error in fan control loop: {e}")
-            self.gui.show_message("Error in fan control loop",
-                                    "Please restart the program.")
+            # Re-raise so main's handler stops the device with a single
+            # dialog — showing one from here would fire on every tick.
+            raise

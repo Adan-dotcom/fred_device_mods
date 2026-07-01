@@ -226,10 +226,16 @@ class Extruder:
             derivative = (error - self.previous_error) / delta_time
             self.previous_error = error
             output = kp * error + ki * self.integral + kd * derivative
+            # Anti-windup (same scheme as the proven old interface): when the
+            # output saturates, undo this tick's integration so the integral
+            # does not wind up during the long heat-up and cause a huge
+            # overshoot once the setpoint is reached.
             if output > Extruder.MAX_OUTPUT:
                 output = Extruder.MAX_OUTPUT
+                self.integral -= error * delta_time
             elif output < Extruder.MIN_OUTPUT:
                 output = Extruder.MIN_OUTPUT
+                self.integral -= error * delta_time
             self.heater_on_fraction = output
             self.gui.temperature_plot.update_plot(current_time, temperature,
                                                     target_temperature)
@@ -242,8 +248,9 @@ class Extruder:
                             self.gui.extrusion_motor_speed.value())
         except Exception as e:
             print(f"Error in temperature control loop: {e}")
-            self.gui.show_message("Error in temperature control loop",
-                                  "Please restart the program.")
+            # Re-raise so main's handler stops the device with a single
+            # dialog — showing one from here would fire on every tick.
+            raise
 
     def stop(self) -> None:
         """Stop the heater and stepper"""

@@ -202,8 +202,9 @@ class Spooler:
             Database.update("spooler_duty_pct", output_duty_cycle)
         except Exception as e:
             print(f"Error in motor control loop: {e}")
-            self.gui.show_message("Error in motor control loop",
-                                  "Please restart the program.")
+            # Re-raise so main's handler stops the device with a single
+            # dialog — showing one from here would fire on every tick.
+            raise
 
     def calibrate(self) -> None:
         """Calibrate the DC Motor"""
