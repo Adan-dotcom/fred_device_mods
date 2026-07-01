@@ -31,16 +31,10 @@ class Thermistor:
         ln = math.log(resistance / cls.RESISTANCE_AT_REFERENCE)
         temperature = (1 / ((ln / cls.BETA_COEFFICIENT) + (1 / cls.REFERENCE_TEMPERATURE))) - 273.15
         Database.temperature_readings.append(temperature)
-        average_temperature = 0
-        if len(Database.temperature_readings) > cls.READINGS_TO_AVERAGE:
-            # Get last constant readings
-            average_temperature = (sum(Database.temperature_readings
-                                      [-cls.READINGS_TO_AVERAGE:]) /
-                                      cls.READINGS_TO_AVERAGE)
-        else:
-            average_temperature = (sum(Database.temperature_readings) /
-                                   len(Database.temperature_readings))
-        return average_temperature
+        # Average the most recent readings. Note: deques do not support
+        # slicing, convert to list first.
+        recent = list(Database.temperature_readings)[-cls.READINGS_TO_AVERAGE:]
+        return sum(recent) / len(recent)
 
 class Extruder:
     """Controller of the extrusion process: the heater and stepper motor"""

@@ -4,7 +4,7 @@ from typing import Tuple
 from PyQt5.QtWidgets import (QApplication, QWidget, QGridLayout, QLabel,
                              QDoubleSpinBox, QSpinBox, QSlider, QPushButton, QMessageBox,
                              QLineEdit, QScrollArea, QVBoxLayout)
-from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtCore import QTimer, Qt, QObject, pyqtSignal
 from PyQt5.QtGui import QPixmap, QImage
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -13,12 +13,24 @@ from database import Database
 from fiber_camera import FiberCamera
 
 
+class _Messenger(QObject):
+    """Relays messages from any thread to the GUI thread via a Qt signal.
+    Creating dialogs directly from the hardware thread crashes Qt
+    (segmentation fault on the RPi)."""
+    message = pyqtSignal(str, str)
+
+
 class UserInterface():
     """"Graphical User Interface Class"""
     def __init__(self) -> None:
         self.app = QApplication([])
         self.window = QWidget()
         self.layout = QGridLayout()
+
+        # Cross-thread message relay: emitting the signal is safe from any
+        # thread; the connected slot runs in this (GUI) thread.
+        self._messenger = _Messenger()
+        self._messenger.message.connect(self._show_message_on_gui_thread)
 
         self.motor_plot, self.temperature_plot, self.diameter_plot \
             = self.add_plots()
@@ -373,8 +385,8 @@ class UserInterface():
 
     def _run_camera_calibration(self) -> None:
         self.fiber_camera.calibrate()
-        QTimer.singleShot(0, lambda: self.show_message(
-            "Calibration", "Camera calibration completed. Please restart the program."))
+        self.show_message("Calibration",
+                          "Camera calibration completed. Please restart the program.")
 
     def set_download_csv(self) -> None:
         """Copy the streaming session log to the user-given filename"""
@@ -388,7 +400,11 @@ class UserInterface():
                                     "first — logging begins on Start.")
 
     def show_message(self, title: str, message: str) -> None:
-        """Show a message box"""
+        """Show a message box. Safe to call from any thread — the dialog is
+        created on the GUI thread via the messenger signal."""
+        self._messenger.message.emit(title, message)
+
+    def _show_message_on_gui_thread(self, title: str, message: str) -> None:
         QMessageBox.information(self.app.activeWindow(), title, message)
 
     class Plot(FigureCanvas):
