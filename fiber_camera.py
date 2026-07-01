@@ -1,5 +1,4 @@
 """Module to process video from camera to obtain the fiber diameter and display it"""
-import time
 import cv2
 import numpy as np
 from typing import Optional, Tuple
@@ -23,11 +22,13 @@ class FiberCamera(QWidget):
         self.threshold_spinbox = threshold_spinbox
         self.capture = cv2.VideoCapture(0)
         self.diameter_coefficient = Database.get_calibration_data("diameter_coefficient")
-        self.previous_time = 0.0
+        # Set while calibrate() runs so camera_loop does not read the same
+        # VideoCapture from another thread (concurrent reads corrupt frames).
+        self.calibrating = False
 
     def camera_loop(self) -> None:
         """Loop to capture and process frames from the camera"""
-        if not self.capture.isOpened():
+        if not self.capture.isOpened() or self.calibrating:
             return
         try:
             success, frame = self.capture.read()
@@ -45,15 +46,11 @@ class FiberCamera(QWidget):
 
             blurred, left_edge, right_edge = self.column_projection(frame, blur_k, threshold)
 
-            Database.diameter_delta_time.append(time.time() - self.previous_time)
-            self.previous_time = time.time()
-
             if left_edge is not None and right_edge is not None and right_edge > left_edge:
                 fiber_diameter = (right_edge - left_edge) * self.diameter_coefficient
                 Database.diameter_readings.append(fiber_diameter)
-                Database.diameter_setpoint.append(self.target_diameter.value())
-                Database.vision_left_edge.append(left_edge)
-                Database.vision_right_edge.append(right_edge)
+                Database.update("diameter_mm", fiber_diameter)
+                Database.update("diameter_setpoint_mm", self.target_diameter.value())
 
             annotated = self.draw_edges(frame, left_edge, right_edge)
             image_for_gui = QImage(annotated, annotated.shape[1], annotated.shape[0],
@@ -98,6 +95,13 @@ class FiberCamera(QWidget):
 
     def calibrate(self) -> None:
         """Calibrate the camera using 20 samples of a 0.45 mm reference object."""
+        self.calibrating = True
+        try:
+            self._calibrate()
+        finally:
+            self.calibrating = False
+
+    def _calibrate(self) -> None:
         num_samples = 20
         accumulated_width = 0
         valid_samples = 0

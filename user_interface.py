@@ -377,10 +377,15 @@ class UserInterface():
             "Calibration", "Camera calibration completed. Please restart the program."))
 
     def set_download_csv(self) -> None:
-        """Call download csv from database"""
-        QMessageBox.information(self.app.activeWindow(), "Download CSV",
-                                "Downloading CSV file.")
-        Database.generate_csv(self.csv_filename.text())
+        """Copy the streaming session log to the user-given filename"""
+        destination = Database.export_csv(self.csv_filename.text())
+        if destination:
+            QMessageBox.information(self.app.activeWindow(), "Download CSV",
+                                    f"CSV file saved to:\n{destination}")
+        else:
+            QMessageBox.information(self.app.activeWindow(), "Download CSV",
+                                    "No data logged yet. Start the device "
+                                    "first — logging begins on Start.")
 
     def show_message(self, title: str, message: str) -> None:
         """Show a message box"""

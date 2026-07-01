@@ -33,11 +33,12 @@ def hardware_control(gui: UserInterface) -> None:
     init_time = time.time()
     stepper_started = False
     device_was_started = False
+    last_log_time = 0.0
+    LOG_PERIOD = 0.1  # one CSV row every 100 ms (10 Hz)
 
     while True:
         try:
             current_time = time.time() - init_time
-            Database.time_readings.append(current_time)
 
             if gui.start_motor_calibration:
                 threading.Thread(target=spooler.calibrate, daemon=True).start()
@@ -48,28 +49,48 @@ def hardware_control(gui: UserInterface) -> None:
                 extruder.stop()
                 stepper_started = False
                 device_was_started = False
+                Database.end_session()
 
             if gui.device_started:
-                device_was_started = True
+                if not device_was_started:
+                    # Start transition: fresh PID state and a new log file
+                    device_was_started = True
+                    extruder.reset_control(current_time)
+                    spooler.reset_control(current_time)
+                    Database.start_session()
                 if not stepper_started:
                     extruder.start_stepper()
                     stepper_started = True
                 extruder.temperature_control_loop(current_time)
                 if gui.spooling_control_state:
                     spooler.motor_control_loop(current_time)
+                else:
+                    # Keep measuring/plotting motor RPM even in open loop
+                    spooler.update_rpm_display(current_time)
                 fan.control_loop()
+
+                if current_time - last_log_time >= LOG_PERIOD:
+                    last_log_time = current_time
+                    Database.log_row(current_time)
 
             time.sleep(0.05)
         except Exception as e:
             print(f"Error in hardware control loop: {e}")
-            gui.show_message("Error in hardware control loop",
-                             "Please restart the program.")
+            # Stop the device so the loop does not retry forever and spam
+            # error dialogs; the user can press Start to try again.
+            gui.device_started = False
+            gui.spooling_control_state = False
+            stepper_started = False
+            device_was_started = False
             if fan:
                 fan.stop()
             if spooler:
                 spooler.stop()
             if extruder:
                 extruder.stop()
+            Database.end_session()
+            gui.show_message("Error in hardware control loop",
+                             "Device stopped. Press Start to try again.")
 
 
 if __name__ == "__main__":

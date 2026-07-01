@@ -70,6 +70,9 @@ class Extruder:
     SAMPLE_TIME = 0.1
     MAX_OUTPUT = 1
     MIN_OUTPUT = 0
+    # Above this reading the thermistor is likely faulty (open circuit reads
+    # ~220 C) or the heater is out of range — either way, force the heater off.
+    MAX_SAFE_TEMPERATURE = 130
 
     def __init__(self, gui: UserInterface) -> None:
         self.gui = gui
@@ -96,9 +99,19 @@ class Extruder:
         self.previous_time = 0.0
         self.previous_error = 0.0
         self.integral = 0.0
+        self._first_sample = True
+        self._sensor_warning_shown = False
 
         self._stepper_running = False
         self._stepper_thread = None
+
+    def reset_control(self, current_time: float) -> None:
+        """Reset the PID state. Call on every Start so the first delta_time
+        is real and no integral windup is carried over from a previous run."""
+        self.previous_time = current_time
+        self.previous_error = 0.0
+        self.integral = 0.0
+        self._first_sample = True
 
     def initialize_thermistor(self):
         """Initialize the SPI for thermistor temperature readings"""
@@ -149,7 +162,6 @@ class Extruder:
                 time.sleep(delay)
                 GPIO.output(Extruder.STEP_PIN, GPIO.LOW)
                 time.sleep(delay)
-                Database.extruder_rpm.append(setpoint_rpm)
             except Exception as e:
                 print(f"Error in stepper loop: {e}")
 
@@ -165,7 +177,29 @@ class Extruder:
 
             delta_time = current_time - self.previous_time
             self.previous_time = current_time
-            temperature = Thermistor.get_temperature(self.channel_0.voltage)
+            voltage = self.channel_0.voltage
+            temperature = Thermistor.get_temperature(voltage)
+
+            if self._first_sample:
+                # First tick only starts the clock — delta_time from a stale
+                # previous_time would blow up the integral and derivative.
+                self._first_sample = False
+                return
+
+            # Sensor sanity: an open/disconnected thermistor pulls the ADC
+            # near the supply rail and reads as a very high temperature.
+            if temperature > Extruder.MAX_SAFE_TEMPERATURE:
+                self.heater_pwm.ChangeDutyCycle(0)
+                Database.update("heater_duty_pct", 0.0)
+                if not self._sensor_warning_shown:
+                    self._sensor_warning_shown = True
+                    print(f"WARNING: temperature reads {temperature:.0f} C "
+                          f"(thermistor voltage {voltage:.2f} V). Heater forced "
+                          "off. If the heater is cold, check the thermistor "
+                          "wiring — a reading near 220 C with ~3.2 V means the "
+                          "thermistor branch is open/disconnected.")
+                return
+
             error = target_temperature - temperature
             self.integral += error * delta_time
             derivative = (error - self.previous_error) / delta_time
@@ -178,21 +212,27 @@ class Extruder:
             self.heater_pwm.ChangeDutyCycle(output * 100)
             self.gui.temperature_plot.update_plot(current_time, temperature,
                                                     target_temperature)
-            Database.temperature_delta_time.append(delta_time)
-            Database.temperature_setpoint.append(target_temperature)
-            Database.temperature_error.append(error)
-            Database.temperature_pid_output.append(output)
-            Database.temperature_kp.append(kp)
-            Database.temperature_ki.append(ki)
-            Database.temperature_kd.append(kd)
+            Database.update("temperature_c", temperature)
+            Database.update("temperature_setpoint_c", float(target_temperature))
+            Database.update("thermistor_v", voltage)
+            Database.update("heater_duty_pct", output * 100)
+            # Stepper reference (open loop — there is no measured stepper speed)
+            Database.update("extruder_setpoint_rpm",
+                            self.gui.extrusion_motor_speed.value())
         except Exception as e:
             print(f"Error in temperature control loop: {e}")
             self.gui.show_message("Error in temperature control loop",
                                   "Please restart the program.")
-            
+
     def stop(self) -> None:
-        """Stop the heater and stepper"""
+        """Stop the heater and stepper. The PWM object is kept alive (duty 0)
+        so the heater works again on the next Start without a restart."""
         self.stop_stepper()
         self.heater_pwm.ChangeDutyCycle(0)
+        Database.update("heater_duty_pct", 0.0)
+
+    def shutdown(self) -> None:
+        """Full stop — only on program exit"""
+        self.stop()
         self.heater_pwm.stop()
 

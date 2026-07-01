@@ -39,6 +39,52 @@ class Spooler:
         self.previous_steps = 0
         self.integral_motor = 0.0
         self.previous_error_motor = 0.0
+        self.last_setpoint_rpm = None
+        self._first_sample = True
+
+    def reset_control(self, current_time: float) -> None:
+        """Reset the PID state. Call on every Start so the first delta_time
+        is real and no integral windup is carried over from a previous run."""
+        self.previous_time = current_time
+        self.previous_steps = self.encoder.steps
+        self.integral_diameter = 0.0
+        self.previous_error_diameter = 0.0
+        self.integral_motor = 0.0
+        self.previous_error_motor = 0.0
+        self.last_setpoint_rpm = None
+        self._first_sample = True
+
+    def _sample(self, current_time: float):
+        """Rate-limited encoder sampling shared by closed loop and display.
+        Returns (delta_time, rpm) or None if called before SAMPLE_TIME."""
+        if current_time - self.previous_time <= Spooler.SAMPLE_TIME:
+            return None
+        delta_time = current_time - self.previous_time
+        self.previous_time = current_time
+        steps = self.encoder.steps
+        delta_steps = steps - self.previous_steps
+        self.previous_steps = steps
+        if self._first_sample:
+            # First tick only starts the clock — a stale previous_time gives
+            # absurd delta_time / rpm and winds up the integrals.
+            self._first_sample = False
+            return None
+        rpm = delta_steps / Spooler.PULSES_PER_REVOLUTION * 60 / delta_time
+        Database.update("spooler_rpm", rpm)
+        Database.update("encoder_steps", steps)
+        return delta_time, rpm
+
+    def update_rpm_display(self, current_time: float) -> None:
+        """Measure and plot the motor RPM while the closed loop is off, so
+        the GUI always shows the real angular speed (and the encoder can be
+        checked: if this stays at 0 while the motor spins, the encoder
+        wiring on GPIO 23/24 is the problem)."""
+        sample = self._sample(current_time)
+        if sample is None:
+            return
+        _, current_rpm = sample
+        setpoint = self.last_setpoint_rpm if self.last_setpoint_rpm else 0.0
+        self.gui.motor_plot.update_plot(current_time, current_rpm, setpoint)
 
     def initialize_encoder(self) -> None:
         """Initialize the encoder and SPI"""
@@ -59,11 +105,13 @@ class Spooler:
         """Update the DC Motor PWM duty cycle"""
         self.pwm.ChangeDutyCycle(duty_cycle)
 
-    def get_average_diameter(self) -> float:
-        """Get the average diameter of the fiber, ignoring zero/invalid readings"""
+    def get_average_diameter(self):
+        """Average of the last valid camera readings, or None if the camera
+        has no valid measurement (never 0 — a fake 0 makes the outer PID
+        slow the motor down, thickening the fiber further)."""
         readings = [d for d in Database.diameter_readings if d > 0]
         if not readings:
-            return 0.0
+            return None
         if len(readings) < Spooler.READINGS_TO_AVERAGE:
             return sum(readings) / len(readings)
         return sum(readings[-Spooler.READINGS_TO_AVERAGE:]) / Spooler.READINGS_TO_AVERAGE
@@ -81,7 +129,8 @@ class Spooler:
     def motor_control_loop(self, current_time: float) -> None:
         """Cascaded PID: outer loop controls diameter → RPM setpoint,
         inner loop controls motor speed → duty cycle."""
-        if current_time - self.previous_time <= Spooler.SAMPLE_TIME:
+        sample = self._sample(current_time)
+        if sample is None:
             return
         try:
             if not self.motor_calibration:
@@ -92,37 +141,41 @@ class Spooler:
             target_diameter = self.gui.target_diameter.value()
             current_diameter = self.get_average_diameter()
 
-            diameter_kp = self.gui.diameter_kp.value()
-            diameter_ki = self.gui.diameter_ki.value()
-            diameter_kd = self.gui.diameter_kd.value()
-
             motor_kp = self.gui.motor_kp.value()
             motor_ki = self.gui.motor_ki.value()
             motor_kd = self.gui.motor_kd.value()
 
-            delta_time = current_time - self.previous_time
-            self.previous_time = current_time
+            delta_time, current_rpm = sample
 
             # --- Outer PID: diameter error → RPM correction ---
             # Sign: current > target (too thick) → positive error → increase RPM → pull faster → thinner
-            error_diameter = current_diameter - target_diameter
-            self.integral_diameter += error_diameter * delta_time
-            self.integral_diameter = max(min(self.integral_diameter, 0.5), -0.5)
-            derivative_diameter = (error_diameter - self.previous_error_diameter) / delta_time
-            self.previous_error_diameter = error_diameter
-            rpm_correction = (diameter_kp * error_diameter
-                              + diameter_ki * self.integral_diameter
-                              + diameter_kd * derivative_diameter)
+            if current_diameter is not None:
+                diameter_kp = self.gui.diameter_kp.value()
+                diameter_ki = self.gui.diameter_ki.value()
+                diameter_kd = self.gui.diameter_kd.value()
 
-            # Feed-forward from volumetric model + PID correction
-            setpoint_rpm = self.diameter_to_rpm(target_diameter) + rpm_correction
-            setpoint_rpm = max(min(setpoint_rpm, 60), 0)
+                error_diameter = current_diameter - target_diameter
+                self.integral_diameter += error_diameter * delta_time
+                self.integral_diameter = max(min(self.integral_diameter, 0.5), -0.5)
+                derivative_diameter = (error_diameter - self.previous_error_diameter) / delta_time
+                self.previous_error_diameter = error_diameter
+                rpm_correction = (diameter_kp * error_diameter
+                                  + diameter_ki * self.integral_diameter
+                                  + diameter_kd * derivative_diameter)
+
+                # Feed-forward from volumetric model + PID correction
+                setpoint_rpm = self.diameter_to_rpm(target_diameter) + rpm_correction
+                setpoint_rpm = max(min(setpoint_rpm, 60), 0)
+                self.last_setpoint_rpm = setpoint_rpm
+            elif self.last_setpoint_rpm is not None:
+                # Vision lost: freeze the outer loop and hold the last good
+                # RPM setpoint instead of chasing a fake diameter of 0.
+                setpoint_rpm = self.last_setpoint_rpm
+            else:
+                # No camera measurement yet: pure volumetric feed-forward.
+                setpoint_rpm = max(min(self.diameter_to_rpm(target_diameter), 60), 0)
 
             # --- Inner PID: RPM error → duty cycle correction ---
-            delta_steps = self.encoder.steps - self.previous_steps
-            self.previous_steps = self.encoder.steps
-            current_rpm = (delta_steps / Spooler.PULSES_PER_REVOLUTION *
-                           60 / delta_time)
             error_motor = setpoint_rpm - current_rpm
             self.integral_motor += error_motor * delta_time
             self.integral_motor = max(min(self.integral_motor, 50), -50)
@@ -140,13 +193,13 @@ class Spooler:
 
             # Update plots
             self.gui.motor_plot.update_plot(current_time, current_rpm, setpoint_rpm)
-            self.gui.diameter_plot.update_plot(current_time, current_diameter, target_diameter)
+            if current_diameter is not None:
+                self.gui.diameter_plot.update_plot(current_time, current_diameter,
+                                                   target_diameter)
 
-            # Log
-            Database.spooler_delta_time.append(delta_time)
-            Database.spooler_setpoint.append(setpoint_rpm)
-            Database.spooler_rpm.append(current_rpm)
-            Database.spooler_duty_cycle.append(output_duty_cycle)
+            # Log (spooler_rpm and encoder_steps updated in _sample)
+            Database.update("spooler_setpoint_rpm", setpoint_rpm)
+            Database.update("spooler_duty_pct", output_duty_cycle)
         except Exception as e:
             print(f"Error in motor control loop: {e}")
             self.gui.show_message("Error in motor control loop",

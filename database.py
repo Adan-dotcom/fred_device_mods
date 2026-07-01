@@ -1,113 +1,108 @@
-import yaml
+"""Data logging: streams samples to a CSV file on disk (one table, one row
+per sample tick, real timestamps) and keeps small rolling buffers in RAM for
+the control loops."""
 import csv
+import time
+import shutil
 from pathlib import Path
+from collections import deque
+
+import yaml
 
 CALIBRATION_FILE = Path(__file__).parent / "calibration.yaml"
 
+# Single-table CSV format: one row per control tick (sample-and-hold for
+# signals that update slower than the logging rate, e.g. the camera).
+CSV_HEADER = [
+    "timestamp",              # real unix time of the row (time.time())
+    "elapsed_s",              # seconds since device start
+    "temperature_c",          # averaged thermistor temperature
+    "temperature_setpoint_c",
+    "thermistor_v",           # raw ADC voltage (sensor diagnostics / observer)
+    "heater_duty_pct",        # duty actually sent to the heater PWM
+    "spooler_rpm",            # measured from encoder
+    "spooler_setpoint_rpm",
+    "spooler_duty_pct",       # duty actually sent to the DC motor PWM
+    "encoder_steps",          # raw cumulative encoder count (diagnostics)
+    "extruder_setpoint_rpm",  # stepper reference (open loop, no measurement)
+    "diameter_mm",            # last camera measurement
+    "diameter_setpoint_mm",
+    "fan_duty_pct",
+]
+
 
 class Database():
-    """Class to store the raw data and generate the CSV file"""
-    time_readings = []
+    """Rolling buffers for control + streaming CSV logger"""
+    # Rolling buffers used by the control loops (bounded, no memory growth)
+    temperature_readings = deque(maxlen=100)
+    diameter_readings = deque(maxlen=50)
 
-    temperature_delta_time = []
-    temperature_readings = []
-    temperature_setpoint = []
-    temperature_error = []
-    temperature_pid_output = []
-    temperature_kp = []
-    temperature_ki = []
-    temperature_kd = []
-    extruder_rpm = []
+    # Latest value of each signal, written out on every log_row() call
+    current = {field: "" for field in CSV_HEADER}
 
-    diameter_delta_time = []
-    diameter_readings = []
-    diameter_setpoint = []
-
-    spooler_delta_time = []
-    spooler_setpoint = []
-    spooler_rpm = []
-    spooler_duty_cycle = []
-
-    fan_duty_cycle = []
-
-    vision_left_edge = []
-    vision_right_edge = []
+    _file = None
+    _writer = None
+    _session_path = None
+    _last_flush = 0.0
 
     @classmethod
-    def generate_csv(cls, filename: str) -> None:
-        """Generate a CSV file with the data"""
-        filename = filename + ".csv"
-        with open(filename, mode='w', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
+    def update(cls, field: str, value) -> None:
+        """Update the latest value of a signal (sample-and-hold)"""
+        cls.current[field] = value
 
-            total_time = cls.time_readings[-1] if cls.time_readings else 0
+    @classmethod
+    def start_session(cls) -> None:
+        """Open a new timestamped CSV file and start streaming to it"""
+        if cls._file is not None:
+            return
+        name = time.strftime("fred_log_%Y%m%d_%H%M%S.csv")
+        cls._session_path = Path(__file__).parent / name
+        cls._file = open(cls._session_path, mode="w", newline="",
+                         encoding="utf-8")
+        cls._writer = csv.writer(cls._file)
+        cls._writer.writerow(CSV_HEADER)
+        cls._last_flush = time.time()
+        print(f"Logging to {cls._session_path}")
 
-            # Temperature Table
-            writer.writerow(["TEMPERATURE DATA"])
-            writer.writerow(["Elapsed Time (s)", "Temperature (C)",
-                            "Temperature setpoint (C)", "Temperature error (C)",
-                            "Temperature PID output", "Temperature Kp",
-                            "Temperature Ki", "Temperature Kd"])
+    @classmethod
+    def log_row(cls, elapsed: float) -> None:
+        """Write one row with the current value of every signal.
+        Buffered I/O, flushed at most once per second to limit SD wear."""
+        if cls._writer is None:
+            return
+        cls.current["timestamp"] = f"{time.time():.3f}"
+        cls.current["elapsed_s"] = f"{elapsed:.3f}"
+        cls._writer.writerow(
+            [f"{v:.4f}" if isinstance(v, float) else v
+             for v in (cls.current[field] for field in CSV_HEADER)])
+        now = time.time()
+        if now - cls._last_flush >= 1.0:
+            cls._file.flush()
+            cls._last_flush = now
 
-            temp_samples = len([x for x in cls.temperature_readings if x != ""])
-            if temp_samples > 0:
-                time_interval = total_time / (temp_samples - 1) if temp_samples > 1 else 0
-                for i in range(temp_samples):
-                    current_time = i * time_interval
-                    writer.writerow([
-                        f"{current_time:.3f}",
-                        cls.temperature_readings[i] if i < len(cls.temperature_readings) else "",
-                        cls.temperature_setpoint[i] if i < len(cls.temperature_setpoint) else "",
-                        cls.temperature_error[i] if i < len(cls.temperature_error) else "",
-                        cls.temperature_pid_output[i] if i < len(cls.temperature_pid_output) else "",
-                        cls.temperature_kp[i] if i < len(cls.temperature_kp) else "",
-                        cls.temperature_ki[i] if i < len(cls.temperature_ki) else "",
-                        cls.temperature_kd[i] if i < len(cls.temperature_kd) else ""])
+    @classmethod
+    def end_session(cls) -> None:
+        """Close the current CSV file"""
+        if cls._file is None:
+            return
+        cls._file.flush()
+        cls._file.close()
+        cls._file = None
+        cls._writer = None
+        print(f"Log saved to {cls._session_path}")
 
-            writer.writerow([])
-            writer.writerow([])
-
-            # Diameter Table
-            writer.writerow(["DIAMETER DATA"])
-            writer.writerow(["Elapsed Time (s)", "Diameter (mm)",
-                            "Diameter setpoint (mm)", "Fan duty cycle (%)",
-                            "Left edge (px)", "Right edge (px)"])
-
-            diameter_samples = len([x for x in cls.diameter_readings if x != ""])
-            if diameter_samples > 0:
-                time_interval = total_time / (diameter_samples - 1) if diameter_samples > 1 else 0
-                for i in range(diameter_samples):
-                    current_time = i * time_interval
-                    writer.writerow([
-                        f"{current_time:.3f}",
-                        cls.diameter_readings[i] if i < len(cls.diameter_readings) else "",
-                        cls.diameter_setpoint[i] if i < len(cls.diameter_setpoint) else "",
-                        cls.fan_duty_cycle[i] if i < len(cls.fan_duty_cycle) else "0",
-                        cls.vision_left_edge[i] if i < len(cls.vision_left_edge) else "",
-                        cls.vision_right_edge[i] if i < len(cls.vision_right_edge) else ""])
-
-            writer.writerow([])
-            writer.writerow([])
-
-            # Motor Table
-            writer.writerow(["MOTOR DATA"])
-            writer.writerow(["Elapsed Time (s)", "Extruder RPM",
-                            "Spooler setpoint (RPM)", "Spooler RPM",
-                            "Spooler duty cycle (%)"])
-
-            motor_samples = len([x for x in cls.spooler_rpm if x != ""])
-            if motor_samples > 0:
-                time_interval = total_time / (motor_samples - 1) if motor_samples > 1 else 0
-                for i in range(motor_samples):
-                    current_time = i * time_interval
-                    writer.writerow([
-                        f"{current_time:.3f}",
-                        cls.extruder_rpm[i] if i < len(cls.extruder_rpm) else "",
-                        cls.spooler_setpoint[i] if i < len(cls.spooler_setpoint) else "",
-                        cls.spooler_rpm[i] if i < len(cls.spooler_rpm) else "",
-                        cls.spooler_duty_cycle[i] if i < len(cls.spooler_duty_cycle) else ""])
-
-        print(f"CSV file {filename} generated.")
+    @classmethod
+    def export_csv(cls, filename: str) -> str:
+        """Copy the session log to the user-given filename.
+        Returns the path of the copy, or an empty string if no data."""
+        if cls._session_path is None or not cls._session_path.exists():
+            return ""
+        if cls._file is not None:
+            cls._file.flush()
+        destination = Path(__file__).parent / (filename + ".csv")
+        shutil.copyfile(cls._session_path, destination)
+        print(f"CSV file {destination} generated.")
+        return str(destination)
 
     @staticmethod
     def get_calibration_data(field: str) -> float:

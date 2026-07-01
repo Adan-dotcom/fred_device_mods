@@ -26,7 +26,7 @@ class Fan:
     def update_duty_cycle(self, duty_cycle: float) -> None:
         """Update speed"""
         self.pwm.ChangeDutyCycle(duty_cycle)
-        Database.fan_duty_cycle.append(duty_cycle)
+        Database.update("fan_duty_pct", float(duty_cycle))
 
     def control_loop(self) -> None:
         """Set the desired speed"""
