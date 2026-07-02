@@ -163,3 +163,5 @@ cython_debug/
 
 # Raw data fiiles
 *.csv
+# FrED session logs (generated at runtime)
+fred_log_*.csv

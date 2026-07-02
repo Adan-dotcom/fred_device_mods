@@ -11,7 +11,6 @@ class Fan:
         self.duty_cycle = 0.0
         self.pwm = None
         GPIO.setup(Fan.PIN, GPIO.OUT)
-        print(self.gui.device_started)
 
     def start(self, frequency: float, duty_cycle: float) -> None:
         """Start the fan PWM"""

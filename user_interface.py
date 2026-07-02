@@ -409,10 +409,16 @@ class UserInterface():
 
     class Plot(FigureCanvas):
         """Base class for plots"""
+        # Control loops run on the hardware thread; Qt drawing must happen
+        # on the GUI thread. update_plot() emits this signal (safe from any
+        # thread) and the redraw runs on the GUI thread.
+        data_ready = pyqtSignal(float, float, float)
+
         def __init__(self, title: str, y_label: str) -> None:
             self.figure = Figure()
             self.axes = self.figure.add_subplot(111)
             super(UserInterface.Plot, self).__init__(self.figure)
+            self.data_ready.connect(self._update_plot_on_gui_thread)
 
             self.axes.set_title(title)
             self.axes.set_xlabel("Time (s)")
@@ -428,7 +434,11 @@ class UserInterface():
             self.setpoint_data = []
 
         def update_plot(self, x: float, y: float, setpoint: float) -> None:
-            """Update the plot"""
+            """Queue a plot update. Safe to call from any thread."""
+            self.data_ready.emit(x, y, setpoint)
+
+        def _update_plot_on_gui_thread(self, x: float, y: float,
+                                       setpoint: float) -> None:
             self.x_data.append(x)
             self.y_data.append(y)
             self.setpoint_data.append(setpoint)
